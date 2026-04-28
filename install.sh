@@ -32,10 +32,6 @@ require_root() {
     [[ $EUID -eq 0 ]] || die "必须使用 root 权限执行脚本。"
 }
 
-require_cmd() {
-    command -v "$1" >/dev/null 2>&1 || die "系统缺少依赖: $1"
-}
-
 get_local_ip() {
     hostname -I 2>/dev/null | awk '{print $1}' || echo "127.0.0.1"
 }
@@ -145,13 +141,17 @@ check_docker_alive() {
 }
 
 wait_postgres() {
+    local pguser="${1:-cloudreve}"
+    local pgdb="${2:-cloudreve}"
     local i
-    for i in $(seq 1 60); do
-        if docker exec cloudreve-postgres pg_isready -U cloudreve -d cloudreve >/dev/null 2>&1; then
+
+    for i in $(seq 1 90); do
+        if docker exec cloudreve-postgres pg_isready -h 127.0.0.1 -p 5432 -U "$pguser" -d "$pgdb" >/dev/null 2>&1; then
             return 0
         fi
         sleep 2
     done
+
     return 1
 }
 
@@ -204,7 +204,7 @@ EOF
     volumes:
       - ./postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -294,7 +294,10 @@ EOF
     write_compose_file "$host_port" "$open_bt" "$bt_port"
 
     info "正在拉起 Cloudreve / PostgreSQL / Redis 容器..."
-    $dc_cmd -f "$COMPOSE_FILE" up -d || { err "容器启动失败，请执行 [10] 查看日志。"; return; }
+    $dc_cmd -f "$COMPOSE_FILE" up -d || {
+        err "容器启动失败，请执行 [10] 查看日志。"
+        return
+    }
 
     local server_ip
     server_ip="$(get_local_ip)"
@@ -320,9 +323,16 @@ make_pg_dump() {
     [[ -n "$workdir" ]] || return 1
     cd "$workdir" || return 1
 
+    local pguser pgdb pgpass
+    pguser="$(grep -oP '^POSTGRES_USER=\K.*' .env 2>/dev/null || echo "cloudreve")"
+    pgdb="$(grep -oP '^POSTGRES_DB=\K.*' .env 2>/dev/null || echo "cloudreve")"
+    pgpass="$(grep -oP '^POSTGRES_PASSWORD=\K.*' .env 2>/dev/null || true)"
+
     $(docker_compose_cmd) -f "$COMPOSE_FILE" up -d postgresql >/dev/null 2>&1 || return 1
-    wait_postgres || return 1
-    docker exec cloudreve-postgres pg_dump -U cloudreve -d cloudreve > "$out_file"
+    wait_postgres "$pguser" "$pgdb" || return 1
+
+    docker exec -i -e PGPASSWORD="$pgpass" cloudreve-postgres \
+        pg_dump -h 127.0.0.1 -p 5432 -U "$pguser" -d "$pgdb" > "$out_file"
 }
 
 upgrade_service() {
@@ -415,11 +425,14 @@ do_backup() {
     if [[ "$backup_type" == "full" ]]; then
         backup_file="${backup_dir}/cloudreve_full_backup_${timestamp}.tar.gz"
         info "开始完整备份，文件多时会比较久..."
-        tar -czf "$backup_file" -C "$tmp_dir" "$COMPOSE_FILE" .env postgres_dump.sql redis_data -C "$workdir" backend_data
+        tar -czf "$backup_file" \
+            -C "$tmp_dir" "$COMPOSE_FILE" .env postgres_dump.sql redis_data \
+            -C "$workdir" backend_data
     else
         backup_file="${backup_dir}/cloudreve_core_backup_${timestamp}.tar.gz"
         info "开始核心备份，不包含 backend_data 文件..."
-        tar -czf "$backup_file" -C "$tmp_dir" "$COMPOSE_FILE" .env postgres_dump.sql redis_data
+        tar -czf "$backup_file" \
+            -C "$tmp_dir" "$COMPOSE_FILE" .env postgres_dump.sql redis_data
     fi
 
     local tar_ec=$?
@@ -474,40 +487,102 @@ restore_backup() {
         return
     fi
 
+    local has_backend_data="0"
+    if tar -tzf "$backup_path" 2>/dev/null | grep -qE '(^|/)backend_data(/|$)'; then
+        has_backend_data="1"
+    fi
+
+    if [[ "$has_backend_data" == "1" ]]; then
+        info "检测到这是完整备份：包含 backend_data 文件数据。"
+    else
+        warn "检测到这是核心备份：不包含 backend_data 文件数据。"
+        warn "核心备份只恢复配置/数据库/Redis，不恢复实际上传文件。"
+    fi
+
     read -r -p "请输入恢复目标路径 [默认: $DEFAULT_INSTALL_PATH]: " input_path
     local target_dir="${input_path:-$DEFAULT_INSTALL_PATH}"
 
     if [[ -d "$target_dir" && -f "$target_dir/$COMPOSE_FILE" ]]; then
-        warn "目标目录已存在实例，恢复将覆盖现有数据。"
+        warn "目标目录已存在实例，恢复将覆盖数据库/配置。"
+        if [[ "$has_backend_data" == "0" ]]; then
+            warn "当前是核心备份，脚本会保留已有 backend_data，避免误删实际文件。"
+        else
+            warn "当前是完整备份，脚本会用备份包里的 backend_data 覆盖现有文件数据。"
+        fi
+
         read -r -p "是否继续？(y/N): " force_override
         if [[ ! "$force_override" =~ ^[Yy]$ ]]; then
             info "已取消恢复。"
             return
         fi
+
         cd "$target_dir" && $(docker_compose_cmd) -f "$COMPOSE_FILE" down || true
-        find "$target_dir" -mindepth 1 -maxdepth 1 ! -name backups -exec rm -rf {} +
+
+        if [[ "$has_backend_data" == "1" ]]; then
+            find "$target_dir" -mindepth 1 -maxdepth 1 ! -name backups -exec rm -rf {} +
+        else
+            find "$target_dir" -mindepth 1 -maxdepth 1 ! -name backups ! -name backend_data -exec rm -rf {} +
+        fi
     fi
 
     mkdir -p "$target_dir"
-    tar -xzf "$backup_path" -C "$target_dir" || { err "解压失败，备份包可能损坏。"; return; }
+
+    info "正在解压备份包..."
+    tar -xzf "$backup_path" -C "$target_dir" || {
+        err "解压失败，备份包可能损坏。"
+        return
+    }
 
     echo "$target_dir" > "$ENV_FILE"
     cd "$target_dir" || return
 
     mkdir -p backend_data postgres_data redis_data backups
 
+    if [[ ! -f "$COMPOSE_FILE" ]]; then
+        err "备份包中缺少 docker-compose.yml，无法恢复。"
+        return
+    fi
+
+    if [[ ! -f ".env" ]]; then
+        err "备份包中缺少 .env，无法恢复。"
+        return
+    fi
+
+    local pgpass pguser pgdb
+    pgpass="$(grep -oP '^POSTGRES_PASSWORD=\K.*' .env 2>/dev/null || true)"
+    pguser="$(grep -oP '^POSTGRES_USER=\K.*' .env 2>/dev/null || echo "cloudreve")"
+    pgdb="$(grep -oP '^POSTGRES_DB=\K.*' .env 2>/dev/null || echo "cloudreve")"
+
     if [[ -f postgres_dump.sql ]]; then
         info "正在启动 PostgreSQL / Redis..."
-        $(docker_compose_cmd) -f "$COMPOSE_FILE" up -d postgresql redis || { err "数据库容器启动失败。"; return; }
-        wait_postgres || { err "PostgreSQL 等待超时。"; return; }
+        $(docker_compose_cmd) -f "$COMPOSE_FILE" up -d postgresql redis || {
+            err "数据库容器启动失败。"
+            return
+        }
+
+        info "等待 PostgreSQL 就绪..."
+        if ! wait_postgres "$pguser" "$pgdb"; then
+            err "PostgreSQL 等待超时。"
+            docker logs --tail=120 cloudreve-postgres || true
+            return
+        fi
 
         info "正在导入 PostgreSQL 数据库..."
-        docker exec -i cloudreve-postgres psql -U cloudreve -d cloudreve < postgres_dump.sql >/dev/null || { err "数据库导入失败。"; return; }
+        if ! docker exec -i -e PGPASSWORD="$pgpass" cloudreve-postgres \
+            psql -h 127.0.0.1 -p 5432 -U "$pguser" -d "$pgdb" < postgres_dump.sql; then
+            err "数据库导入失败。"
+            docker logs --tail=120 cloudreve-postgres || true
+            return
+        fi
     else
         warn "备份包中没有 postgres_dump.sql，将直接启动容器。"
     fi
 
-    $(docker_compose_cmd) -f "$COMPOSE_FILE" up -d || { err "恢复启动失败。"; return; }
+    info "正在启动 Cloudreve..."
+    $(docker_compose_cmd) -f "$COMPOSE_FILE" up -d || {
+        err "恢复启动失败。"
+        return
+    }
 
     local server_ip host_port
     server_ip="$(get_local_ip)"
@@ -517,6 +592,9 @@ restore_backup() {
     echo -e "\033[32m✅ Cloudreve 恢复完成\033[0m"
     echo -e "访问地址: \033[36mhttp://${server_ip}:${host_port}\033[0m"
     echo -e "恢复路径: \033[33m${target_dir}\033[0m"
+    if [[ "$has_backend_data" == "0" ]]; then
+        echo -e "\033[33m注意：本次使用的是核心备份，不包含 backend_data 文件数据。\033[0m"
+    fi
     echo -e "==================================================\n"
 }
 
@@ -620,10 +698,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+PGUSER=\$(grep -oP '^POSTGRES_USER=\K.*' .env 2>/dev/null || echo "cloudreve")
+PGDB=\$(grep -oP '^POSTGRES_DB=\K.*' .env 2>/dev/null || echo "cloudreve")
+PGPASS=\$(grep -oP '^POSTGRES_PASSWORD=\K.*' .env 2>/dev/null || true)
+
 cp "\$COMPOSE_FILE" "\$TMP_DIR/\$COMPOSE_FILE"
 cp .env "\$TMP_DIR/.env"
 
-docker exec cloudreve-postgres pg_dump -U cloudreve -d cloudreve > "\$TMP_DIR/postgres_dump.sql" || exit 1
+docker exec -i -e PGPASSWORD="\$PGPASS" cloudreve-postgres \\
+    pg_dump -h 127.0.0.1 -p 5432 -U "\$PGUSER" -d "\$PGDB" > "\$TMP_DIR/postgres_dump.sql" || exit 1
+
 cp -a redis_data "\$TMP_DIR/redis_data" 2>/dev/null || mkdir -p "\$TMP_DIR/redis_data"
 
 if [[ "\$BACKUP_TYPE" == "full" ]]; then
@@ -639,7 +723,11 @@ ls -t cloudreve_*_backup_*.tar.gz 2>/dev/null | awk 'NR>5' | xargs -r rm -f
 EOF
     chmod +x "$cron_script"
 
-    tmp_cron="$(mktemp)" || { err "创建临时文件失败。"; return; }
+    tmp_cron="$(mktemp)" || {
+        err "创建临时文件失败。"
+        return
+    }
+
     crontab -l 2>/dev/null | sed "/^${CRON_TAG_BEGIN}$/,/^${CRON_TAG_END}$/d" > "$tmp_cron" || true
 
     cat >> "$tmp_cron" <<EOF
@@ -705,8 +793,10 @@ show_status() {
         return
     fi
     cd "$workdir" || return
+
     echo "================ Docker Compose 状态 ================"
     $(docker_compose_cmd) -f "$COMPOSE_FILE" ps || true
+
     echo "================ 最近日志 ================"
     $(docker_compose_cmd) -f "$COMPOSE_FILE" logs --tail=120 cloudreve postgresql redis || true
 }
@@ -718,7 +808,9 @@ show_info() {
         err "未检测到部署环境。"
         return
     fi
+
     cd "$workdir" || return
+
     local server_ip host_port bt_port db_pass
     server_ip="$(get_local_ip)"
     host_port="$(grep -oP '^SERVER_PORT=\K.*' .env 2>/dev/null || echo "5212")"
