@@ -349,6 +349,8 @@ upgrade_service() {
     info "升级前先做一次数据库+配置备份..."
     do_backup "silent" "core"
 
+    cd "$workdir"
+
     info "正在拉取最新镜像并重建容器..."
     $(docker_compose_cmd) -f "$COMPOSE_FILE" pull
     $(docker_compose_cmd) -f "$COMPOSE_FILE" up -d
